@@ -32,7 +32,7 @@ from model import QuestionMatching
 
 # yapf: disable
 parser = argparse.ArgumentParser()
-parser.add_argument("--train_set", type=str,default="train.txt", required=True, help="The full path of train_set_file")
+parser.add_argument("--train_set", type=str, default="train.txt", required=True, help="The full path of train_set_file")
 parser.add_argument("--dev_set", type=str, default="dev.txt", required=True, help="The full path of dev_set_file")
 parser.add_argument("--save_dir", default='./checkpoint', type=str,
                     help="The output directory where the model checkpoints will be written.")

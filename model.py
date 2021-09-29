@@ -37,10 +37,19 @@ class QuestionMatching(nn.Layer):
                 attention_mask=None,
                 do_evaluate=False):
 
-        _, cls_embedding1 = self.ptm(input_ids, token_type_ids, position_ids,
-                                     attention_mask)
-        cls_embedding1 = self.dropout(cls_embedding1)
-        logits1 = self.classifier(cls_embedding1)
+        encoder_output, cls_embedding1 = self.ptm(input_ids, token_type_ids, position_ids,
+                                                  attention_mask)  # [batch_size = 32,sentence_pair_length,hidden_state = 768] [batch_size = 32,768]
+
+        '''
+            将 encoder_output （各个token的嵌入表示） 作为输入
+            在bert后上添加自己的东西
+        '''
+
+        cls_embedding1 = self.dropout(cls_embedding1)  # [32,768]
+        '''
+            分类层改进
+        '''
+        logits1 = self.classifier(cls_embedding1)  # [batch_size, 2] 二分类
 
         # For more information about R-drop please refer to this paper: https://arxiv.org/abs/2106.14448
         # Original implementation please refer to this code: https://github.com/dropreg/R-Drop
@@ -54,3 +63,16 @@ class QuestionMatching(nn.Layer):
             kl_loss = 0.0
 
         return logits1, kl_loss
+
+
+class MatchLSTM(nn.Layer):
+    def __init__(self):
+        pass
+
+
+class CrossAttention(nn.Layer):
+    def __init__(self):
+        self.rnn = nn.LSTM
+
+    def forward(self, *inputs, **kwargs):
+        pass
