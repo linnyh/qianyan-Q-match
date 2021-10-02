@@ -14,6 +14,7 @@
 
 import paddle
 import paddle.nn as nn
+import math
 import numpy as np
 from paddlenlp.data import Pad
 import paddle.nn.functional as F
@@ -61,24 +62,27 @@ def split_bert_output(encoder_output, token_type_ids):
     i = 0
     max_len_a = 0
     max_len_b = 0
+    max_len = 0
     for sp in range(len(encoder_output)):
         s_a = encoder_output[sp][1:split_ids[i][0], :]
         s_b = encoder_output[sp][split_ids[i][0]:split_ids[i][1] if split_ids[i][1] < len(encoder_output[sp]) else -1,
               :]
         max_len_a = max(max_len_a, s_a.shape[0])
         max_len_b = max(max_len_b, s_b.shape[0])
+        max_len = max(max_len, max_len_a, max_len_b)
         sentence_a.append(s_a)
         sentence_b.append(s_b)
         i = i + 1
     pad = encoder_output.shape[2] * [0.0]
     for sp in range(len(encoder_output)):
-        if len(sentence_a[sp]) < max_len_a:
+        if len(sentence_a[sp]) < max_len:
             sentence_a[sp] = paddle.concat(
-                x=[sentence_a[sp], paddle.to_tensor([pad] * (max_len_a - len(sentence_a[sp])))], axis=0)
-        if len(sentence_b[sp]) < max_len_b:
+                x=[sentence_a[sp], paddle.to_tensor([pad] * (max_len - len(sentence_a[sp])))], axis=0)
+            # sentence_a[sp] = F.pad(sentence_a[sp], [0, 0, 0, max_len - len(sentence_a[sp]), 0, 0])
+        if len(sentence_b[sp]) < max_len:
             sentence_b[sp] = paddle.concat(
-                x=[sentence_b[sp], paddle.to_tensor([pad] * (max_len_b - len(sentence_b[sp])))], axis=0)
-
+                x=[sentence_b[sp], paddle.to_tensor([pad] * (max_len - len(sentence_b[sp])))], axis=0)
+            # sentence_b[sp] = F.pad(sentence_b[sp], [0, 0, 0, max_len - len(sentence_b[sp]), 0, 0])
     sentence_a = paddle.to_tensor(sentence_a)
     sentence_b = paddle.to_tensor(sentence_b)
     return sentence_a, sentence_b
@@ -88,10 +92,12 @@ class QuestionMatching(nn.Layer):
     def __init__(self, pretrained_model, dropout=None, rdrop_coef=0.0):
         super().__init__()
         self.ptm = pretrained_model  # 预训练模型
-        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        self.hidden_size = self.ptm.config['hidden_size']
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.5)
         self.lstm = MatchLSTM(self.ptm.config["hidden_size"], self.ptm.config["hidden_size"], 1)
+        self.word_attention = WordAttention(input_size=self.hidden_size, hidden_size=256, rnn_layers=1)
         # num_labels = 2 (similar or dissimilar)
-        self.classifier = nn.Linear(self.ptm.config["hidden_size"] * 2, 512)  # 线性分类层
+        self.classifier = nn.Linear(self.hidden_size * 2, 512)  # 线性分类层
         self.classifier2 = nn.Linear(512, 2)
         self.rdrop_coef = rdrop_coef
         self.rdrop_loss = ppnlp.losses.RDropLoss()
@@ -109,23 +115,12 @@ class QuestionMatching(nn.Layer):
         # 拆分句子嵌入
         sentence_a, sentence_b = split_bert_output(encoder_output, token_type_ids)
 
-        # 将两个句子分别通过bilstm编码
-        output_a, state_a = self.lstm(sentence_a)
-        output_b, state_b = self.lstm(sentence_b)
-        state_a = paddle.squeeze(x=state_a[0], axis=0)
-        state_b = paddle.squeeze(x=state_b[0], axis=0)
-        print("cls:")
-        print(cls_embedding1.shape)
-        print("lstm:")
-        print(state_a.shape, state_b.shape)
+        att = self.word_attention(sentence_a, sentence_b, self.ptm.config['hidden_size'])
+        print("attention:")
+        print(att.shape)
 
-        # 计算差异
-        diff = state_a - state_b
-        print("diff:")
-        print(diff.shape)
-
-        # 将cls与差异连接
-        classifier_input = paddle.concat(x=[cls_embedding1, diff], axis=1)
+        # 将cls与上下文连接
+        classifier_input = paddle.concat(x=[cls_embedding1, att], axis=1)
 
         print("classifier_input:")
         print(classifier_input.shape)
@@ -136,6 +131,7 @@ class QuestionMatching(nn.Layer):
         '''
         logits1 = self.classifier(final)  # [batch_size, 2] 二分类
         logits1 = self.classifier2(logits1)
+
         # For more information about R-drop please refer to this paper: https://arxiv.org/abs/2106.14448
         # Original implementation please refer to this code: https://github.com/dropreg/R-Drop
         if self.rdrop_coef > 0 and not do_evaluate:
@@ -147,7 +143,7 @@ class QuestionMatching(nn.Layer):
         else:
             kl_loss = 0.0
 
-        return logits1, kl_loss
+        return F.softmax(logits1, axis=1), kl_loss
 
 
 class MatchLSTM(nn.Layer):
@@ -163,7 +159,34 @@ class MatchLSTM(nn.Layer):
 
 class WordAttention(nn.Layer):  # 通过将MatchLSTM 的输出做一个词级别attention
     def __init__(self, input_size, hidden_size, rnn_layers):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.u_T = nn.Linear(input_size, hidden_size)
+        self.w_a = nn.Linear(input_size, hidden_size)
+        self.w_b = nn.Linear(input_size, hidden_size)
+        self.layer_norm = nn.LayerNorm(input_size)
         self.lstm = MatchLSTM(input_size, hidden_size, rnn_layers)  # 编码用的lstm
+        self.scores = None
 
-    def forward(self, *inputs, **kwargs):
-        pass
+    def attention(self, q, k, v, d_k, mask=None):
+        scores = paddle.matmul(q, paddle.transpose(k, (0, 2, 1))) / math.sqrt(d_k)
+        scores = paddle.tanh(scores)
+        self.scores = scores
+        # return paddle.matmul(scores, v)
+        return scores
+
+    def forward(self, a, b, d_k, mask=None):
+        bs = a.shape[0]
+        max_len = max(a.shape[1], b.shape[1])
+        a = F.pad(a, [0, 0, 0, max_len - a.shape[1], 0, 0])
+        b = F.pad(b, [0, 0, 0, max_len - b.shape[1], 0, 0])
+
+        q = F.softmax(self.w_a(a), axis=2)
+        k = F.softmax(self.w_b(b), axis=2)
+
+        scores = self.attention(q, k, None, 768)  # (batch, len, len)
+        c = paddle.sum(paddle.matmul(scores, b), axis=1)  # (batch, hidden_state)
+
+        c = self.layer_norm(c)
+
+        return c
